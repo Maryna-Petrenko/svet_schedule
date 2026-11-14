@@ -26,9 +26,10 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           QUEUE: "4.1"
-          #SEND_LAST: "1"   # розкоментуйте для першого тесту, потім приберіть
+          # GEMINI_MODEL: "gemini-2.5-flash"   # якщо основна модель недоступна
+          SEND_LAST: "1"   # розкоментуйте для першого тесту, потім приберіть
       - name: Зберегти стан
         run: |
           git config user.name "outage-bot"
