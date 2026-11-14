@@ -6,7 +6,7 @@
 Як визначається, чи стосується пост вашої черги:
   1) Текстовий пост зі списком черг  -> надсилаємо лише рядки про вашу чергу;
      зміни в інших чергах ігноруються (порівнюється тільки "ваша" частина).
-  2) Пост-картинка з графіком        -> картинку "читає" Claude (потрібен ANTHROPIC_API_KEY),
+  2) Пост-картинка з графіком        -> картинку "читає" Gemini (потрібен GEMINI_API_KEY),
      витягує періоди для вашої черги; повідомлення йде лише якщо вони нові/змінились.
   3) Загальні тексти про графіки (напр. "додаткові відключення") -> надсилаються,
      якщо ALSO_GENERAL=1 (за замовчуванням так).
@@ -15,8 +15,8 @@
   BOT_TOKEN          токен бота від @BotFather                    (обов'язково)
   CHAT_ID            id групи, напр. -4218775853                  (обов'язково)
   QUEUE              ваша черга, за замовчуванням 4.1
-  ANTHROPIC_API_KEY  ключ для розпізнавання картинок (необов'язково)
-  MODEL              модель Claude, за замовчуванням claude-sonnet-5-5
+  GEMINI_API_KEY     ключ Google Gemini для розпізнавання картинок (необов'язково)
+  GEMINI_MODEL       модель, за замовчуванням gemini-3.5-flash (запасна: gemini-2.5-flash)
   UNCERTAIN          send|skip: що робити, якщо чергу в картинці не вдалось визначити (send)
   ALSO_GENERAL       1|0: пересилати загальні пости про графіки (1)
   CHANNEL            username каналу без @ (chernigivoblenergo)
@@ -39,8 +39,8 @@ from bs4 import BeautifulSoup
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 QUEUE = os.environ.get("QUEUE", "4.1").strip()
-API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MODEL = os.environ.get("MODEL", "claude-sonnet-5-5")
+API_KEY = os.environ.get("GEMINI_API_KEY", "")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 UNCERTAIN = os.environ.get("UNCERTAIN", "send")
 ALSO_GENERAL = os.environ.get("ALSO_GENERAL", "1") == "1"
 CHANNEL = os.environ.get("CHANNEL", "chernigivoblenergo").lstrip("@")
@@ -56,9 +56,9 @@ SEND_LAST = os.environ.get("SEND_LAST") == "1"
 KEEP = 100
 UA = {"User-Agent": "Mozilla/5.0 (compatible; outage-family-bot/1.0)"}
 
-_a, _b = re.split(r"[.,]", QUEUE)
-MY_QUEUE_RE = re.compile(rf"(?<![\d.,]){_a}\s*[.,]\s*{_b}(?!\d)")
-ANY_QUEUE_RE = re.compile(r"(?<![\d.,])[1-9]\s*[.,]\s*[1-9](?!\d)")
+_a, _b = re.split(r"[.,/]", QUEUE)
+MY_QUEUE_RE = re.compile(rf"(?<![\d.,/]){_a}\s*[./,]\s*{_b}(?!\d)")
+ANY_QUEUE_RE = re.compile(r"(?<![\d.,/])[1-9]\s*[./,]\s*[1-9](?!\d)")
 
 
 # ---------- Telegram-канал ----------
@@ -102,8 +102,8 @@ def classify(post):
     kind: queue_text | image | general"""
     text = post["text"]
     queue_mentions = ANY_QUEUE_RE.findall(text)
-    if len(set(m.replace(",", ".").replace(" ", "") for m in queue_mentions)) >= 2:
-        lines = [l for l in text.split("\n") if l.strip()]
+    if len(set(m.replace(",", ".").replace("/", ".").replace(" ", "") for m in queue_mentions)) >= 2:
+        lines = [l for l in text.split("\n") if any(c.isalpha() for c in l)]
         mine = [l for l in lines if MY_QUEUE_RE.search(l)]
         if not mine:
             return "queue_text", h(""), ""
@@ -114,7 +114,7 @@ def classify(post):
     return "general", h(text), text
 
 
-# ---------- Розпізнавання картинки через Claude ----------
+# ---------- Розпізнавання картинки через Gemini ----------
 def get_image(url):
     r = requests.get(url, headers=UA, timeout=60)
     r.raise_for_status()
@@ -125,54 +125,68 @@ def get_image(url):
 
 
 def read_my_queue(img, media_type):
-    """Повертає {"found":bool,"date":"YYYY-MM-DD"|None,"periods":[...]} або None."""
+    """Повертає {"found":bool,"date":"YYYY-MM-DD"|None,"outages":[{"from","to"}]} або None."""
     if not API_KEY:
         return None
     today = datetime.datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d")
     prompt = (
-        f"Це графік відключень електроенергії (Чернігівобленерго). Сьогодні {today}. "
-        f"Знайди рядок для черги/підчерги {QUEUE} (може бути записано як {QUEUE}, "
-        f"{QUEUE.replace('.', ',')} або 'черга {_a} підчерга {_b}'). Зазвичай кольори: "
-        "чорний = світла немає, синій/сірий = можливе відключення, зелений/білий = світло є "
-        "(звір з легендою на картинці). Поверни ЛИШЕ JSON без пояснень і без ```:\n"
+        "Це картинка з графіком погодинних відключень електроенергії (Чернігівобленерго): "
+        "сітка карток, кожна для черги/підчерги (1.1, 1.2, 2.1 ... 6.2); під номером картки "
+        "перелічені інтервали, коли світла НЕ буде (біля значка блискавки). "
+        f"Сьогодні {today}. Знайди картку {QUEUE} (може бути записано як {QUEUE}, "
+        f"{QUEUE.replace('.', ',')} або {QUEUE.replace('.', '/')}). Дату графіка візьми із заголовка картинки. "
+        "Поверни ЛИШЕ JSON без пояснень і без ```:\n"
         '{"found": true|false, "date": "YYYY-MM-DD"|null, '
-        '"periods": [{"from": "HH:MM", "to": "HH:MM", "status": "off"|"maybe"|"on"}]}\n'
-        "Періоди мають покривати добу послідовно, сусідні з однаковим статусом об'єднай. "
-        f'Якщо черги {QUEUE} на картинці немає або картинка не є графіком черг - found=false, periods=[].'
+        '"outages": [{"from": "HH:MM", "to": "HH:MM"}]}\n'
+        "У outages - тільки інтервали відключення саме з картки " + QUEUE + ", точно як на картинці; "
+        'кінець опівночі запиши як "24:00". Якщо в картці інтервалів немає - outages=[]. '
+        f"Якщо картки {QUEUE} на картинці немає або це не графік черг - found=false."
     )
     body = {
-        "model": MODEL,
-        "max_tokens": 800,
-        "messages": [{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": media_type,
-                                          "data": base64.b64encode(img).decode()}},
-            {"type": "text", "text": prompt}]}],
+        "contents": [{"parts": [
+            {"inline_data": {"mime_type": media_type,
+                             "data": base64.b64encode(img).decode()}},
+            {"text": prompt}]}],
+        "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
     }
     r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01",
-                 "content-type": "application/json"},
+        f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent",
+        headers={"x-goog-api-key": API_KEY, "content-type": "application/json"},
         json=body, timeout=120)
     r.raise_for_status()
-    txt = "".join(b.get("text", "") for b in r.json()["content"] if b["type"] == "text")
+    parts = r.json()["candidates"][0]["content"]["parts"]
+    txt = "".join(p_.get("text", "") for p_ in parts if not p_.get("thought"))
     txt = re.sub(r"```(?:json)?", "", txt).strip()
     return json.loads(txt)
 
 
-EMOJI = {"off": "🔴", "maybe": "🟡", "on": "🟢"}
-LABEL = {"off": "світла немає", "maybe": "можливе відключення", "on": "світло є"}
+SEP = "~" * 22
 
 
 def summarize(res, link):
-    d = res.get("date")
+    """Текст у стилі бота обленерго: Початок / Закінчення."""
     try:
-        d = datetime.date.fromisoformat(d).strftime("%d.%m.%Y")
+        d = datetime.date.fromisoformat(res.get("date"))
     except Exception:
-        d = "дата не визначена"
-    lines = [f"{EMOJI.get(p['status'], '•')} {p['from']}–{p['to']} — {LABEL.get(p['status'], p['status'])}"
-             for p in res["periods"]]
-    return (f"Графік для черги {QUEUE} на {d}\n\n" + "\n".join(lines) +
-            f"\n\n⚠️ Розпізнано автоматично з картинки, звіряйте з оригіналом.\nДжерело: {link}")
+        d = None
+    outages = res.get("outages") or []
+    if not outages:
+        when = d.strftime("%d-%m-%Y") if d else "вказану дату"
+        body = f"Відключень для черги {QUEUE} на {when} не заплановано."
+    else:
+        blocks = []
+        for o in outages:
+            f, t = o["from"], o["to"]
+            end_d, end_t = d, t
+            if t in ("24:00", "00:00") or t <= f:
+                end_d = d + datetime.timedelta(days=1) if d else None
+                end_t = "00:00" if t in ("24:00", "00:00") else t
+            ds = d.strftime("%d-%m-%Y ") if d else ""
+            de = end_d.strftime("%d-%m-%Y ") if end_d else ""
+            blocks.append(f"Початок: {ds}{f}\nЗакінчення: {de}{end_t}")
+        body = f"Графік погодинних відключень (ГПВ)\n" + ("\n" + SEP + "\n").join(blocks) + "\n" + SEP
+    return (f"Черга {QUEUE}\n{body}\n\n"
+            f"ℹ️ Розпізнано з картинки каналу (Gemini), звіряйте з оригіналом: {link}")
 
 
 # ---------- Telegram-бот ----------
@@ -231,20 +245,20 @@ def process(post, kind, rel, updated, qstate):
             res = read_my_queue(img, mt)
         except Exception as e:
             print(f"Не вдалось розпізнати картинку поста {post['id']}: {e}", file=sys.stderr)
-        if res and res.get("found") and res.get("periods"):
+        if res and res.get("found"):
             key = res.get("date") or f"post{post['id']}"
-            ph = h(json.dumps(res["periods"], sort_keys=True))
+            ph = h(json.dumps(res.get("outages") or [], sort_keys=True))
             prev = qstate.get(key)
             if prev == ph:
                 return False  # для вашої черги нічого не змінилось
             msg = summarize(res, post["link"])
             if prev is not None:
                 msg = "🔄 Змінилось!\n" + msg
-            send(msg, img)
+            send(msg)
             qstate[key] = ph
             return True
         if UNCERTAIN == "send":
-            why = "ключ Claude не задано" if not API_KEY else f"не знайшов чергу {QUEUE} на картинці"
+            why = "ключ Gemini не задано" if not API_KEY else f"не знайшов чергу {QUEUE} на картинці"
             send(f"{head}Чернігівобленерго (картинка; {why}, перегляньте самі)\n\n"
                  f"{post['text']}\n\nДжерело: {post['link']}", img)
             return True
