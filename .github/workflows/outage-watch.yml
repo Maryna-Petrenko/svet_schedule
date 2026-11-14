@@ -28,7 +28,7 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           QUEUE: "4.1"
-          SEND_LAST: "1"   # розкоментуйте для першого тесту, потім приберіть
+          #SEND_LAST: "1"   # розкоментуйте для першого тесту, потім приберіть
       - name: Зберегти стан
         run: |
           git config user.name "outage-bot"
