@@ -31,6 +31,7 @@ import json
 import os
 import re
 import sys
+import time
 from zoneinfo import ZoneInfo
 
 import requests
@@ -149,15 +150,35 @@ def read_my_queue(img, media_type):
             {"text": prompt}]}],
         "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
     }
-    r = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent",
-        headers={"x-goog-api-key": API_KEY, "content-type": "application/json"},
-        json=body, timeout=120)
-    r.raise_for_status()
-    parts = r.json()["candidates"][0]["content"]["parts"]
-    txt = "".join(p_.get("text", "") for p_ in parts if not p_.get("thought"))
-    txt = re.sub(r"```(?:json)?", "", txt).strip()
-    return json.loads(txt)
+    models = [MODEL] + [m for m in ("gemini-2.5-flash", "gemini-flash-latest") if m != MODEL]
+    last_err = None
+    for model in models:
+        for attempt in range(3):
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers={"x-goog-api-key": API_KEY, "content-type": "application/json"},
+                json=body, timeout=120)
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                print(f"модель {model}: тимчасова помилка {r.status_code}, повтор через {5 * (attempt + 1)} с",
+                      file=sys.stderr)
+                time.sleep(5 * (attempt + 1))
+                continue
+            break
+        if r.status_code != 200:
+            last_err = f"модель {model}: HTTP {r.status_code} {r.text[:300]}"
+            print(last_err, file=sys.stderr)
+            continue
+        try:
+            parts = r.json()["candidates"][0]["content"]["parts"]
+            txt = "".join(p_.get("text", "") for p_ in parts if not p_.get("thought"))
+            txt = re.sub(r"```(?:json)?", "", txt).strip()
+            print(f"Gemini ({model}) відповів: {txt[:400]}")
+            return json.loads(txt)
+        except Exception as e:
+            last_err = f"модель {model}: не вдалось розібрати відповідь: {e}; {r.text[:300]}"
+            print(last_err, file=sys.stderr)
+            continue
+    raise RuntimeError(last_err or "жодна модель Gemini не відповіла")
 
 
 SEP = "~" * 22
@@ -221,15 +242,18 @@ def load_state():
         return json.load(f)
 
 
-def save_state(seen, q):
+def save_state(seen, q, fails=None):
     keep = dict(sorted(seen.items(), key=lambda kv: int(kv[0]))[-KEEP:])
     q = dict(sorted(q.items())[-14:])
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"seen": keep, "q": q}, f, ensure_ascii=False, indent=1)
+        json.dump({"seen": keep, "q": q, "fails": fails or {}}, f, ensure_ascii=False, indent=1)
 
 
 # ---------- Обробка одного поста ----------
-def process(post, kind, rel, updated, qstate):
+MAX_FAILS = 3  # стільки запусків чекаємо, якщо Gemini тимчасово недоступний
+
+
+def process(post, kind, rel, updated, qstate, fails):
     """Надсилає повідомлення за потреби. Повертає True, якщо щось надіслано."""
     head = "🔄 Оновлено: " if updated else "⚡ "
     if kind == "queue_text":
@@ -240,10 +264,13 @@ def process(post, kind, rel, updated, qstate):
 
     if kind == "image":
         img, mt = get_image(post["photo"])
+        print(f"пост {post['id']}: картинка {len(img)} байт, {mt}")
         res = None
+        err = None
         try:
             res = read_my_queue(img, mt)
         except Exception as e:
+            err = e
             print(f"Не вдалось розпізнати картинку поста {post['id']}: {e}", file=sys.stderr)
         if res and res.get("found"):
             key = res.get("date") or f"post{post['id']}"
@@ -257,6 +284,11 @@ def process(post, kind, rel, updated, qstate):
             send(msg)
             qstate[key] = ph
             return True
+        if err is not None and API_KEY:
+            n = fails.get(str(post["id"]), 0) + 1
+            fails[str(post["id"])] = n
+            if n < MAX_FAILS:
+                raise RuntimeError(f"Gemini тимчасово недоступний, спробую знову (спроба {n}/{MAX_FAILS})")
         if UNCERTAIN == "send":
             why = "ключ Gemini не задано" if not API_KEY else f"не знайшов чергу {QUEUE} на картинці"
             send(f"{head}Чернігівобленерго (картинка; {why}, перегляньте самі)\n\n"
@@ -283,6 +315,7 @@ def main():
     first_run = state is None
     seen = {} if first_run else state.get("seen", {})
     qstate = {} if first_run else state.get("q", {})
+    fails = {} if first_run else state.get("fails", {})
 
     if first_run:
         hit = None
@@ -292,27 +325,34 @@ def main():
             if keyword_match(p):
                 hit = (p, kind, rel)
         if SEND_LAST and hit:
-            process(hit[0], hit[1], hit[2], False, qstate)
-        save_state(seen, qstate)
+            process(hit[0], hit[1], hit[2], False, qstate, fails)
+        save_state(seen, qstate, fails)
         print(f"Перший запуск: запамʼятав {len(posts)} постів.")
         return
 
+    print(f"Прочитано постів: {len(posts)}, останній id: {posts[-1]['id']}")
     sent = 0
     for p in posts:
         key = str(p["id"])
         kind, dg, rel = classify(p)
         old = seen.get(key)
         if old == dg:
+            print(f"пост {p['id']}: без змін ({kind}), пропуск")
             continue
+        status = "не відповідає фільтру"
         if keyword_match(p) or kind == "queue_text":
             try:
-                if process(p, kind, rel, old is not None, qstate):
+                if process(p, kind, rel, old is not None, qstate, fails):
                     sent += 1
+                    status = "НАДІСЛАНО"
+                else:
+                    status = "вас не стосується / без змін для вашої черги"
             except Exception as e:  # стан не оновлюємо - повторимо наступного разу
                 print(f"Помилка поста {p['id']}: {e}", file=sys.stderr)
                 continue
+        print(f"пост {p['id']}: {'новий' if old is None else 'змінений'} ({kind}) -> {status}")
         seen[key] = dg
-    save_state(seen, qstate)
+    save_state(seen, qstate, fails)
     print(f"Готово. Надіслано: {sent}.")
 
 
