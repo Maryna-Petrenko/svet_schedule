@@ -98,17 +98,37 @@ def h(s):
 
 
 # ---------- Класифікація поста ----------
+def clean_line(l):
+    """Прибирає ведучі емодзі/розділювачі."""
+    return re.sub(r"^[^\w«\"]+", "", l).strip()
+
+
+def trim_boilerplate(text):
+    """Відрізає типовий "хвіст" постів (попередження, нагадування, посилання)."""
+    cut = len(text)
+    for m in ("⚠", "Якщо ситуація", "🤔", "Нагадуємо"):
+        i = text.find(m)
+        if i != -1:
+            cut = min(cut, i)
+    return text[:cut].strip() or text.strip()
+
+
 def classify(post):
     """-> (kind, digest, relevant_text)
-    kind: queue_text | image | general"""
+    kind: queue_text | image | general
+    Якщо в ТЕКСТІ поста згадуються черги (хоч одна), картинку не аналізуємо."""
     text = post["text"]
-    queue_mentions = ANY_QUEUE_RE.findall(text)
-    if len(set(m.replace(",", ".").replace("/", ".").replace(" ", "") for m in queue_mentions)) >= 2:
-        lines = [l for l in text.split("\n") if any(c.isalpha() for c in l)]
-        mine = [l for l in lines if MY_QUEUE_RE.search(l)]
+    lines = [l for l in text.split("\n") if any(c.isalpha() for c in l)]
+    mine = [l for l in lines if MY_QUEUE_RE.search(l)]
+    mentions = set(
+        m.replace(",", ".").replace("/", ".").replace(" ", "") for m in ANY_QUEUE_RE.findall(text)
+    )
+    queue_lines = [l for l in lines if ANY_QUEUE_RE.search(l) and "черг" in l.lower()]
+    if mine or len(mentions) >= 2 or queue_lines:
         if not mine:
-            return "queue_text", h(""), ""
-        rel = (lines[0] + "\n" if not MY_QUEUE_RE.search(lines[0]) else "") + "\n".join(mine)
+            return "queue_text", h(""), ""  # пост про інші черги
+        title = clean_line(lines[0]) if lines and not MY_QUEUE_RE.search(lines[0]) else ""
+        rel = (title + "\n" if title else "") + "\n".join(clean_line(l) for l in mine)
         return "queue_text", h(rel), rel
     if post["photo"]:
         return "image", h(text), text
@@ -292,13 +312,13 @@ def process(post, kind, rel, updated, qstate, fails):
         if UNCERTAIN == "send":
             why = "ключ Gemini не задано" if not API_KEY else f"не знайшов чергу {QUEUE} на картинці"
             send(f"{head}Чернігівобленерго (картинка; {why}, перегляньте самі)\n\n"
-                 f"{post['text']}\n\nДжерело: {post['link']}", img)
+                 f"{trim_boilerplate(post['text'])}\n\nДжерело: {post['link']}", img)
             return True
         return False
 
     # general
     if ALSO_GENERAL:
-        send(f"{head}Чернігівобленерго\n\n{post['text']}\n\nДжерело: {post['link']}")
+        send(f"{head}Чернігівобленерго\n\n{trim_boilerplate(post['text'])}\n\nДжерело: {post['link']}")
         return True
     return False
 
