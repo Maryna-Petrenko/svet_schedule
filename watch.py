@@ -9,7 +9,7 @@
   2) Пост-картинка з графіком        -> картинку "читає" Gemini (потрібен GEMINI_API_KEY),
      витягує періоди для вашої черги; повідомлення йде лише якщо вони нові/змінились.
   3) Загальні тексти про графіки (напр. "додаткові відключення") -> надсилаються,
-     якщо ALSO_GENERAL=1 (за замовчуванням так).
+     якщо ALSO_GENERAL=1 (за замовчуванням ні).
 
 Змінні оточення:
   BOT_TOKEN          токен бота від @BotFather                    (обов'язково)
@@ -17,8 +17,8 @@
   QUEUE              ваша черга, за замовчуванням 4.1
   GEMINI_API_KEY     ключ Google Gemini для розпізнавання картинок (необов'язково)
   GEMINI_MODEL       модель, за замовчуванням gemini-3.5-flash (запасна: gemini-2.5-flash)
-  UNCERTAIN          send|skip: що робити, якщо чергу в картинці не вдалось визначити (send)
-  ALSO_GENERAL       1|0: пересилати загальні пости про графіки (1)
+  UNCERTAIN          send|skip: що робити, якщо Gemini не знайшов чергу на картинці (skip)
+  ALSO_GENERAL       1|0: пересилати загальні пости без згадки черг (0)
   CHANNEL            username каналу без @ (chernigivoblenergo)
   KEYWORDS           слова-фільтри через кому
   STATE_FILE         файл стану (state.json)
@@ -42,8 +42,8 @@ CHAT_ID = os.environ.get("CHAT_ID", "")
 QUEUE = os.environ.get("QUEUE", "4.1").strip()
 API_KEY = os.environ.get("GEMINI_API_KEY", "")
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
-UNCERTAIN = os.environ.get("UNCERTAIN", "send")
-ALSO_GENERAL = os.environ.get("ALSO_GENERAL", "1") == "1"
+UNCERTAIN = os.environ.get("UNCERTAIN", "skip")
+ALSO_GENERAL = os.environ.get("ALSO_GENERAL", "0") == "1"
 CHANNEL = os.environ.get("CHANNEL", "chernigivoblenergo").lstrip("@")
 KEYWORDS = [
     k.strip().lower()
@@ -304,13 +304,16 @@ def process(post, kind, rel, updated, qstate, fails):
             send(msg)
             qstate[key] = ph
             return True
-        if err is not None and API_KEY:
+        api_failed = err is not None and bool(API_KEY)
+        if api_failed:
             n = fails.get(str(post["id"]), 0) + 1
             fails[str(post["id"])] = n
             if n < MAX_FAILS:
                 raise RuntimeError(f"Gemini тимчасово недоступний, спробую знову (спроба {n}/{MAX_FAILS})")
-        if UNCERTAIN == "send":
-            why = "ключ Gemini не задано" if not API_KEY else f"не знайшов чергу {QUEUE} на картинці"
+        # Якщо Gemini відповів, що вашої черги на картинці немає - мовчимо (UNCERTAIN=skip).
+        # Якщо ж він просто не працював кілька запусків поспіль - надсилаємо коротке попередження.
+        if UNCERTAIN == "send" or api_failed:
+            why = "ключ Gemini не задано" if not API_KEY else ("Gemini недоступний" if api_failed else f"не знайшов чергу {QUEUE} на картинці")
             send(f"{head}Чернігівобленерго (картинка; {why}, перегляньте самі)\n\n"
                  f"{trim_boilerplate(post['text'])}\n\nДжерело: {post['link']}", img)
             return True
